@@ -29,11 +29,10 @@ from __future__ import print_function
 from future.utils import iteritems
 try:
     from future.utils import text_type
-except:
+except ImportError:
     from six import text_type
 
 import logging
-import os
 import re
 import subprocess
 import shlex
@@ -134,7 +133,7 @@ def addChanges(remote, changei, src='git'):
         except StopIteration:
             remote.broker.transport.loseConnection()
             finished_d.callback(None)
-        except e:
+        except Exception as e:
             logging.error(e)
 
     iter()
@@ -147,7 +146,12 @@ def connected(remote):
 
 def grab_commit_info(c, rev):
     # Extract information about committer and files using git show
-    f = subprocess.Popen(shlex.split("git show --raw --pretty=full %s" % rev),
+    options = "--raw --pretty=full"
+    if first_parent:
+        # Show the full diff for merges to avoid losing changes
+        # when builds are not triggered for merged in commits
+        options += " --diff-merges=first-parent"
+    f = subprocess.Popen(shlex.split("git show %s %s" % (options, rev)),
                          stdout=subprocess.PIPE)
 
     files = []
@@ -163,8 +167,9 @@ def grab_commit_info(c, rev):
 
         m = re.match(r"^:.*[MAD]\s+(.+)$", line)
         if m:
-            logging.debug("Got file: %s", m.group(1))
-            files.append(text_type(m.group(1)))
+            file = m.group(1)
+            logging.debug("Got file: %s", file)
+            files.append(text_type(file))
             continue
 
         m = re.match(r"^Author:\s+(.+)$", line)
@@ -172,7 +177,8 @@ def grab_commit_info(c, rev):
             logging.debug("Got author: %s", m.group(1))
             c['who'] = text_type(m.group(1))
 
-        if re.match(r"^Merge: .*$", line):
+        # Retain default behavior if all commits trigger builds
+        if not first_parent and re.match(r"^Merge: .*$", line):
             files.append('merge')
 
     c['comments'] = ''.join(comments)
@@ -227,11 +233,14 @@ def gen_create_branch_changes(newrev, refname, branch):
     f2 = subprocess.Popen(shlex.split("grep -v %s" % branchref),
                           stdin=f.stdout,
                           stdout=subprocess.PIPE)
-    f3 = subprocess.Popen(
-        shlex.split("git rev-list --reverse --pretty=oneline --stdin %s" % newrev),
-        stdin=f2.stdout,
-        stdout=subprocess.PIPE
-    )
+    options = "--reverse --pretty=oneline --stdin"
+    if first_parent:
+        # Don't add merged commits to avoid running builds twice for the same
+        # changes, as they should only be done for first parent commits
+        options += " --first-parent"
+    f3 = subprocess.Popen(shlex.split("git rev-list %s %s" % (options, newrev)),
+                          stdin=f2.stdout,
+                          stdout=subprocess.PIPE)
 
     gen_changes(f3, branch)
 
@@ -288,9 +297,11 @@ def gen_update_branch_changes(oldrev, newrev, refname, branch):
             if not line:
                 break
 
-            file = re.match(r"^:.*[MAD]\s+(.+)$", line).group(1)
-            logging.debug("  Rewound file: %s", file)
-            files.append(text_type(file))
+            m = re.match(r"^:.*[MAD]\s+(.+)$", line)
+            if m:
+                file = m.group(1)
+                logging.debug("  Rewound file: %s", file)
+                files.append(text_type(file))
 
         status = f.wait()
         if status:
